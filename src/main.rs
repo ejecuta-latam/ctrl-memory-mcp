@@ -1,4 +1,5 @@
 mod config;
+mod embedder;
 mod index;
 mod note;
 mod server;
