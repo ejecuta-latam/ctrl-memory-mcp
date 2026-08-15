@@ -4,8 +4,9 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, ListResourcesResult, ReadResourceRequestParams,
-        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ListResourcesResult,
+        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        ServerCapabilities, ServerInfo,
     },
     schemars::JsonSchema,
     service::RequestContext,
@@ -514,7 +515,7 @@ mod tests {
 }
 
 #[tool_handler(
-    name = "memory",
+    name = "ctrl-memory",
     version = "0.1.0",
     instructions = "Obsidian vault memory server. Tools: read_note, write_note, delete_note, list_notes, search_notes, index_memory, memory_stats. Resource: memory://writing-guide — agents must read it before writing notes."
 )]
@@ -526,6 +527,7 @@ impl ServerHandler for MemoryServer {
                 .enable_tools()
                 .build(),
         )
+        .with_server_info(Implementation::new("ctrl-memory", env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_resources(

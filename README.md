@@ -81,7 +81,7 @@ printf %s 'YOUR-KEY' | gcloud secrets versions add PERSONAL_MCP_API_KEY \
 ```json
 {
   "mcp": {
-    "memory": {
+    "ctrl-memory": {
       "type": "remote",
       "url": "http://127.0.0.1:8737/mcp",
       "headers": { "Authorization": "Bearer {env:MEMORY_MCP_KEY}" },
@@ -102,7 +102,7 @@ export MEMORY_MCP_KEY="$(gcloud secrets access latest --secret=PERSONAL_MCP_API_
 **Claude Code** (stdio mode):
 
 ```bash
-claude mcp add memory -- /absolute/path/to/memory-mcp/target/release/memory-mcp
+claude mcp add ctrl-memory -- /absolute/path/to/memory-mcp/target/release/memory-mcp
 ```
 
 ## Configuration
