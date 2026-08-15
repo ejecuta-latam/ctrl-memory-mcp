@@ -1,5 +1,7 @@
 mod config;
+mod note;
 mod server;
+mod vault;
 
 use rmcp::{ServiceExt, transport::stdio};
 
