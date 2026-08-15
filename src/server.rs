@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 
 use rmcp::{
-    ErrorData as McpError, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, ContentBlock},
+    model::{
+        CallToolResult, ContentBlock, ListResourcesResult, ReadResourceRequestParams,
+        ReadResourceResult, Resource, ResourceContents, ServerCapabilities, ServerInfo,
+    },
     schemars::JsonSchema,
+    service::RequestContext,
     tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -19,8 +23,42 @@ const EMBED_BATCH_SIZE: usize = 32;
 const RRF_K: f64 = 60.0;
 const SNIPPET_CHARS: usize = 200;
 
+const WRITING_GUIDE: &str = r#"# How to write notes for this memory
+
+These rules make notes index and search well (keyword + semantic hybrid).
+
+## Frontmatter (always)
+
+---
+title: Clear human title
+tags: [topic, sub/topic]
+aliases: [synonym one, synonym two]
+---
+
+## Structure
+
+- One idea per note. Split broad notes instead of cramming topics together.
+- The # Title should match the filename stem.
+- ## Sections become chunks: each H2/H3 section is embedded as one vector chunk.
+- Keep sections roughly 50-500 words. A short note is a single chunk.
+- Link instead of re-explaining: [[Related Note]] keeps context without duplication.
+- Short paragraphs, lists and code blocks; avoid walls of text.
+
+## How search sees your note
+
+- Keyword search matches exact words in title, headings, tags and content.
+- Semantic search matches meaning; aliases and descriptive headings help it.
+- Frontmatter tags and wikilinks are stored as searchable metadata.
+
+## When to use aliases
+
+Add aliases for names you (or an agent) might search for later: project
+code names, abbreviations, alternative spellings, translated terms.
+"#;
+
 #[derive(Clone)]
 pub struct MemoryServer {
+    #[allow(dead_code)]
     tool_router: ToolRouter<Self>,
     config: Config,
     vault: Vault,
@@ -243,12 +281,8 @@ impl MemoryServer {
             self.index.wipe()?;
         }
 
-        let vault_paths: Vec<String> = self
-            .vault
-            .list_files()
-            .into_iter()
-            .map(|f| f.path)
-            .collect();
+        let files = self.vault.list_files();
+        let vault_paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let indexed_paths = self.index.all_note_paths()?;
 
         let mut removed = 0;
@@ -259,34 +293,28 @@ impl MemoryServer {
             }
         }
 
-        let mut pending: Vec<(String, String)> = Vec::new();
-        for path in &vault_paths {
-            let raw = self.vault.read_raw(path)?;
+        let mut pending: Vec<(crate::vault::VaultFile, String)> = Vec::new();
+        for file in &files {
+            let raw = self.vault.read_raw(&file.path)?;
             let hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
-            let metadata = std::fs::metadata(self.vault.root().join(path))?;
-            let mtime = metadata
-                .modified()
-                .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
-                .unwrap_or(0);
-            let size = metadata.len() as i64;
-            let indexed = self.index.get_note(path)?;
+            let indexed = self.index.get_note(&file.path)?;
             if !full
                 && indexed
                     .as_ref()
-                    .is_some_and(|n| n.mtime == mtime && n.size == size && n.hash == hash)
+                    .is_some_and(|n| n.mtime == file.mtime && n.size == file.size && n.hash == hash)
             {
                 continue;
             }
-            pending.push((path.clone(), raw));
+            pending.push((file.clone(), raw));
         }
 
         let mut chunks_total = 0usize;
         for batch in pending.chunks(EMBED_BATCH_SIZE) {
             let mut parsed = Vec::new();
-            for (path, raw) in batch {
-                let note = crate::note::Note::parse(path, raw);
+            for (file, raw) in batch {
+                let note = crate::note::Note::parse(&file.path, raw);
                 let chunks = index::chunk_note(&note.body);
-                parsed.push((path.clone(), note, chunks));
+                parsed.push((file.clone(), note, chunks));
             }
             let texts: Vec<String> = parsed
                 .iter()
@@ -294,28 +322,29 @@ impl MemoryServer {
                 .collect();
             let embeddings = self.embedder.embed(&texts)?;
             let mut offset = 0;
-            for (path, note, chunks) in parsed {
+            for (file, note, chunks) in parsed {
                 let chunk_count = chunks.len();
                 let slice = &embeddings[offset..offset + chunk_count];
                 offset += chunk_count;
-                let metadata = std::fs::metadata(self.vault.root().join(&path))?;
-                let mtime = metadata
-                    .modified()
-                    .map(|t| t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0))
-                    .unwrap_or(0);
-                let size = metadata.len() as i64;
                 let hash = blake3::hash(note.raw.as_bytes()).to_hex().to_string();
                 let id = self.index.upsert_note(
-                    &path,
+                    &file.path,
                     &note.title,
-                    mtime,
-                    size,
-                    &hash,
+                    &crate::index::FileState {
+                        mtime: file.mtime,
+                        size: file.size,
+                        hash,
+                    },
                     &note.tags(),
                     &note.wikilinks(),
                 )?;
-                self.index
-                    .replace_note_chunks(id, &note.title, &chunks, slice)?;
+                self.index.replace_note_chunks(
+                    id,
+                    &note.title,
+                    &note_meta(&note),
+                    &chunks,
+                    slice,
+                )?;
                 chunks_total += chunk_count;
             }
         }
@@ -344,14 +373,17 @@ impl MemoryServer {
         let id = self.index.upsert_note(
             path,
             &note.title,
-            mtime,
-            size,
-            &hash,
+            &crate::index::FileState { mtime, size, hash },
             &note.tags(),
             &note.wikilinks(),
         )?;
-        self.index
-            .replace_note_chunks(id, &note.title, &chunks, &embeddings)?;
+        self.index.replace_note_chunks(
+            id,
+            &note.title,
+            &note_meta(&note),
+            &chunks,
+            &embeddings,
+        )?;
         Ok(chunks.len())
     }
 
@@ -407,6 +439,14 @@ impl MemoryServer {
             })
             .collect())
     }
+}
+
+fn note_meta(note: &crate::note::Note) -> String {
+    let mut parts = vec![note.title.clone()];
+    parts.extend(note.tags());
+    parts.extend(note.wikilinks());
+    parts.extend(note.frontmatter.aliases.clone());
+    parts.join(" ")
 }
 
 fn rrf_merge(keyword: &[(i64, f64)], semantic: &[(i64, f64)]) -> Vec<(i64, f64)> {
@@ -476,6 +516,45 @@ mod tests {
 #[tool_handler(
     name = "memory",
     version = "0.1.0",
-    instructions = "Obsidian vault memory server: read/write notes, search the indexed memory, and reindex on demand."
+    instructions = "Obsidian vault memory server. Tools: read_note, write_note, delete_note, list_notes, search_notes, index_memory, memory_stats. Resource: memory://writing-guide — agents must read it before writing notes."
 )]
-impl ServerHandler for MemoryServer {}
+impl ServerHandler for MemoryServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_resources()
+                .enable_tools()
+                .build(),
+        )
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, McpError> {
+        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+            "memory://writing-guide",
+            "Rules for writing notes so they index and search well",
+        )]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        if request.uri.as_str() == "memory://writing-guide" {
+            Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                WRITING_GUIDE,
+                &request.uri,
+            )])
+            .into())
+        } else {
+            Err(McpError::resource_not_found(
+                "resource_not_found",
+                Some(json!({ "uri": request.uri })),
+            ))
+        }
+    }
+}

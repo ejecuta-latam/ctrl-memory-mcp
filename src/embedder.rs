@@ -8,7 +8,9 @@ use tokenizers::utils::padding::{PaddingParams, PaddingStrategy};
 use tokenizers::utils::truncation::TruncationParams;
 use tokenizers::Tokenizer;
 
+#[cfg(test)]
 use crate::config::Config;
+#[cfg(test)]
 use crate::index::EMBEDDING_DIM;
 
 const MODEL_URL: &str =

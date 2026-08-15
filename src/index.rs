@@ -7,6 +7,7 @@ use regex::Regex;
 use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, params};
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub const EMBEDDING_DIM: usize = 384;
 const MAX_CHUNK_WORDS: usize = 400;
 
@@ -25,6 +26,21 @@ fn load_vec_extension() {
     }
 }
 
+fn ensure_fts_columns(conn: &Connection) -> anyhow::Result<()> {
+    let has_meta = conn
+        .prepare("SELECT name FROM pragma_table_info('fts_chunks') WHERE name = 'meta'")?
+        .exists([])?;
+    if !has_meta {
+        conn.execute_batch("DROP TABLE fts_chunks")?;
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE fts_chunks USING fts5(
+                chunk_id UNINDEXED, title, heading, content, meta, tokenize='unicode61'
+            )",
+        )?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct Chunk {
     pub heading: String,
@@ -41,10 +57,7 @@ pub struct ChunkDetail {
 }
 
 #[derive(Debug)]
-pub struct NoteRow {
-    pub id: i64,
-    pub path: String,
-    pub title: String,
+pub struct FileState {
     pub mtime: i64,
     pub size: i64,
     pub hash: String,
@@ -65,6 +78,7 @@ impl Index {
         Self::init(conn)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> anyhow::Result<Self> {
         load_vec_extension();
         Self::init(Connection::open_in_memory()?)
@@ -90,27 +104,23 @@ impl Index {
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(embedding float[384]);
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
-                chunk_id UNINDEXED, title, heading, content, tokenize='unicode61'
+                chunk_id UNINDEXED, title, heading, content, meta, tokenize='unicode61'
             );",
         )?;
+        ensure_fts_columns(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    pub fn get_note(&self, path: &str) -> anyhow::Result<Option<NoteRow>> {
+    pub fn get_note(&self, path: &str) -> anyhow::Result<Option<FileState>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, path, title, mtime, size, hash FROM notes WHERE path = ?1",
-        )?;
+        let mut stmt = conn.prepare("SELECT mtime, size, hash FROM notes WHERE path = ?1")?;
         let mut rows = stmt.query_map([path], |r| {
-            Ok(NoteRow {
-                id: r.get(0)?,
-                path: r.get(1)?,
-                title: r.get(2)?,
-                mtime: r.get(3)?,
-                size: r.get(4)?,
-                hash: r.get(5)?,
+            Ok(FileState {
+                mtime: r.get(0)?,
+                size: r.get(1)?,
+                hash: r.get(2)?,
             })
         })?;
         rows.next().transpose().map_err(Into::into)
@@ -120,9 +130,7 @@ impl Index {
         &self,
         path: &str,
         title: &str,
-        mtime: i64,
-        size: i64,
-        hash: &str,
+        state: &FileState,
         tags: &[String],
         links: &[String],
     ) -> anyhow::Result<i64> {
@@ -134,7 +142,15 @@ impl Index {
                 title = excluded.title, mtime = excluded.mtime, size = excluded.size,
                 hash = excluded.hash, tags = excluded.tags, links = excluded.links
              RETURNING id",
-            params![path, title, mtime, size, hash, tags.join(","), links.join(",")],
+            params![
+                path,
+                title,
+                state.mtime,
+                state.size,
+                state.hash,
+                tags.join(","),
+                links.join(",")
+            ],
             |r| r.get(0),
         )?;
         Ok(id)
@@ -164,6 +180,7 @@ impl Index {
         &self,
         note_id: i64,
         title: &str,
+        meta: &str,
         chunks: &[Chunk],
         embeddings: &[Vec<f32>],
     ) -> anyhow::Result<()> {
@@ -193,8 +210,8 @@ impl Index {
                 params![chunk_id, vector],
             )?;
             tx.execute(
-                "INSERT INTO fts_chunks (chunk_id, title, heading, content) VALUES (?1, ?2, ?3, ?4)",
-                params![chunk_id, title, chunk.heading, chunk.content],
+                "INSERT INTO fts_chunks (chunk_id, title, heading, content, meta) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![chunk_id, title, chunk.heading, chunk.content, meta],
             )?;
         }
         tx.commit()?;
@@ -220,14 +237,10 @@ impl Index {
             "SELECT chunk_id, bm25(fts_chunks) FROM fts_chunks
              WHERE fts_chunks MATCH ?1 ORDER BY bm25(fts_chunks) LIMIT ?2",
         )?;
-        let mut results = Vec::new();
-        let mut rows = stmt.query_map(params![fts_query(query), limit as i64], |r| {
+        let rows = stmt.query_map(params![fts_query(query), limit as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
         })?;
-        while let Some(row) = rows.next() {
-            results.push(row?);
-        }
-        Ok(results)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn vector_search(
@@ -241,14 +254,10 @@ impl Index {
              WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
         )?;
         let query = serde_json::to_string(vector)?;
-        let mut results = Vec::new();
-        let mut rows = stmt.query_map(params![query, limit as i64], |r| {
+        let rows = stmt.query_map(params![query, limit as i64], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?))
         })?;
-        while let Some(row) = rows.next() {
-            results.push(row?);
-        }
-        Ok(results)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn all_note_paths(&self) -> anyhow::Result<Vec<String>> {
@@ -271,8 +280,7 @@ impl Index {
             .iter()
             .map(|id| rusqlite::types::Value::Integer(*id))
             .collect();
-        let mut details = Vec::new();
-        let mut rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
             Ok(ChunkDetail {
                 chunk_id: r.get(0)?,
                 path: r.get(1)?,
@@ -281,10 +289,7 @@ impl Index {
                 content: r.get(4)?,
             })
         })?;
-        while let Some(row) = rows.next() {
-            details.push(row?);
-        }
-        Ok(details)
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
 
@@ -337,15 +342,11 @@ pub fn chunk_note(body: &str) -> Vec<Chunk> {    let mut chunks = Vec::new();
                     buffer.push_str(&code);
                 }
             }
-            Event::SoftBreak | Event::HardBreak => {
-                if !in_heading {
-                    buffer.push(' ');
-                }
+            Event::SoftBreak | Event::HardBreak if !in_heading => {
+                buffer.push(' ');
             }
-            Event::End(TagEnd::Paragraph) => {
-                if !in_heading {
-                    buffer.push_str("\n\n");
-                }
+            Event::End(TagEnd::Paragraph) if !in_heading => {
+                buffer.push_str("\n\n");
             }
             _ => {}
         }
@@ -501,14 +502,24 @@ Sometimes the compiler needs help with lifetime annotations.
     fn crud_and_search_flow() {
         let index = Index::open_in_memory().unwrap();
         let id = index
-            .upsert_note("a.md", "A", 1, 10, "h1", &["rust".to_string()], &["B".to_string()])
+            .upsert_note(
+                "a.md",
+                "A",
+                &FileState {
+                    mtime: 1,
+                    size: 10,
+                    hash: "h1".to_string(),
+                },
+                &["rust".to_string()],
+                &["B".to_string()],
+            )
             .unwrap();
         assert_eq!(index.note_count().unwrap(), 1);
 
         let chunks = chunk_note(&sample_note());
         let embeddings: Vec<Vec<f32>> = chunks.iter().map(|c| dummy_vec(&c.content)).collect();
         index
-            .replace_note_chunks(id, "Rust Notes", &chunks, &embeddings)
+            .replace_note_chunks(id, "Rust Notes", "Rust Notes rust", &chunks, &embeddings)
             .unwrap();
 
         let hits = index.keyword_search("borrow checker", 5).unwrap();
