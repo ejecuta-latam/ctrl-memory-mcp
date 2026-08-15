@@ -1,4 +1,5 @@
 mod config;
+mod index;
 mod note;
 mod server;
 mod vault;
