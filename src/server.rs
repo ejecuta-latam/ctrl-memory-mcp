@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -14,6 +16,8 @@ use crate::index::{self, Index};
 use crate::vault::Vault;
 
 const EMBED_BATCH_SIZE: usize = 32;
+const RRF_K: f64 = 60.0;
+const SNIPPET_CHARS: usize = 200;
 
 #[derive(Clone)]
 pub struct MemoryServer {
@@ -48,6 +52,35 @@ struct FolderArgs {
 struct ReindexArgs {
     #[schemars(description = "Set to true to drop the index and rebuild from scratch")]
     full: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+#[schemars(inline)]
+#[schemars(extend("type" = "string"))]
+enum SearchMode {
+    Hybrid,
+    Keyword,
+    Semantic,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SearchArgs {
+    #[schemars(description = "Search query in natural language or keywords")]
+    query: String,
+    #[schemars(description = "Search strategy: hybrid (default), keyword (FTS5), or semantic (vector)")]
+    mode: Option<SearchMode>,
+    #[schemars(description = "Maximum number of results, default 10")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchHit {
+    path: String,
+    title: String,
+    heading: String,
+    snippet: String,
+    score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -180,6 +213,30 @@ impl MemoryServer {
         }
     }
 
+    #[tool(description = "Search the vault memory. Hybrid mode (default) merges keyword (FTS5) and semantic (vector) results; keyword is exact-word matching; semantic finds meaningfully related notes. Returns ranked hits with snippets.")]
+    async fn search_notes(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let query = args.query.trim().to_string();
+        if query.is_empty() {
+            return tool_error("query must not be empty".to_string());
+        }
+        let server = self.clone();
+        let mode = args.mode.unwrap_or(SearchMode::Hybrid);
+        let limit = args.limit.unwrap_or(10).clamp(1, 50);
+        let result = tokio::task::spawn_blocking(move || server.search_blocking(&query, mode, limit))
+            .await;
+        match result {
+            Ok(Ok(hits)) if hits.is_empty() => {
+                tool_error("no matches found — the index may be empty; try index_memory first".to_string())
+            }
+            Ok(Ok(hits)) => ok_json(json!({ "query": args.query, "hits": hits })),
+            Ok(Err(e)) => tool_error(e.to_string()),
+            Err(e) => tool_error(format!("search_notes failed: {e}")),
+        }
+    }
+
     fn reindex_blocking(&self, full: bool) -> anyhow::Result<IndexStats> {
         let started = std::time::Instant::now();
         if full {
@@ -297,6 +354,87 @@ impl MemoryServer {
             .replace_note_chunks(id, &note.title, &chunks, &embeddings)?;
         Ok(chunks.len())
     }
+
+    fn search_blocking(
+        &self,
+        query: &str,
+        mode: SearchMode,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        let candidates = limit * 3;
+        let keyword = self.index.keyword_search(query, candidates)?;
+        let scored: Vec<(i64, f64)> = match mode {
+            SearchMode::Keyword => keyword
+                .iter()
+                .map(|(id, bm25)| (*id, -bm25))
+                .collect(),
+            SearchMode::Semantic => {
+                let vector = self.embedder.embed(&[query.to_string()])?.remove(0);
+                self.index
+                    .vector_search(&vector, candidates)?
+                    .iter()
+                    .map(|(id, distance)| (*id, 1.0 - distance))
+                    .collect()
+            }
+            SearchMode::Hybrid => {
+                let vector = self.embedder.embed(&[query.to_string()])?.remove(0);
+                let semantic = self.index.vector_search(&vector, candidates)?;
+                rrf_merge(&keyword, &semantic)
+            }
+        };
+        self.hits_from_scored(scored, limit)
+    }
+
+    fn hits_from_scored(&self, mut scored: Vec<(i64, f64)>, limit: usize) -> anyhow::Result<Vec<SearchHit>> {
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        let ids: Vec<i64> = scored.iter().map(|(id, _)| *id).collect();
+        let details = self.index.chunk_details(&ids)?;
+        let by_id: HashMap<i64, _> = details
+            .into_iter()
+            .map(|d| (d.chunk_id, d))
+            .collect();
+        Ok(scored
+            .into_iter()
+            .filter_map(|(id, score)| {
+                by_id.get(&id).map(|d| SearchHit {
+                    path: d.path.clone(),
+                    title: d.title.clone(),
+                    heading: d.heading.clone(),
+                    snippet: snippet(&d.content),
+                    score,
+                })
+            })
+            .collect())
+    }
+}
+
+fn rrf_merge(keyword: &[(i64, f64)], semantic: &[(i64, f64)]) -> Vec<(i64, f64)> {
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for (rank, (id, _)) in keyword.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    for (rank, (id, _)) in semantic.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    scores.into_iter().collect()
+}
+
+fn snippet(content: &str) -> String {
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = collapsed
+        .char_indices()
+        .nth(SNIPPET_CHARS)
+        .map(|(i, _)| i)
+        .unwrap_or(collapsed.len());
+    while !collapsed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut snippet = collapsed[..end].to_string();
+    if collapsed.len() > end {
+        snippet.push('…');
+    }
+    snippet
 }
 
 fn ok_json(value: serde_json::Value) -> Result<CallToolResult, McpError> {
@@ -307,6 +445,32 @@ fn ok_json(value: serde_json::Value) -> Result<CallToolResult, McpError> {
 
 fn tool_error(message: String) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::error(vec![ContentBlock::text(message)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rrf_merges_both_sources() {
+        let keyword = [(1, -3.0), (2, -5.0)];
+        let semantic = [(3, 0.9), (1, 0.7)];
+        let merged = rrf_merge(&keyword, &semantic);
+        assert_eq!(merged.len(), 3);
+        let top = merged.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).unwrap();
+        assert_eq!(top.0, 1);
+    }
+
+    #[test]
+    fn snippet_collapses_and_truncates() {
+        let content = "First paragraph line.\n\nSecond paragraph line.";
+        let snip = snippet(content);
+        assert_eq!(snip, "First paragraph line. Second paragraph line.");
+        let long = "word ".repeat(500);
+        let snip = snippet(&long);
+        assert!(snip.ends_with('…'));
+        assert!(snip.chars().count() <= SNIPPET_CHARS + 1);
+    }
 }
 
 #[tool_handler(
