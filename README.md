@@ -42,6 +42,69 @@ cargo build --release
 # binary: target/release/memory-mcp
 ```
 
+## Transports
+
+The server runs in one of two modes (env `MEMORY_MCP_TRANSPORT`):
+
+- `stdio` (default) — speak MCP over stdin/stdout, for `type: local` agents.
+- `http` — serve MCP over streamable HTTP on `127.0.0.1:8737/mcp`,
+  protected by an API key. Every request must carry
+  `Authorization: Bearer <key>`.
+
+## API-key authentication (http mode)
+
+At startup the server fetches the secret `PERSONAL_MCP_API_KEY` from GCP
+Secret Manager (project `sonic-totem-447414-t7`, using Application Default
+Credentials — no key in your environment) and caches it in memory. Incoming
+requests are validated against that key; missing or wrong tokens get a `401`.
+You share the same key with the agent client so it can send it in the header.
+
+### Run it as a service
+
+```bash
+# the unit is at ~/.config/systemd/user/memory-mcp.service
+systemctl --user daemon-reload
+systemctl --user enable --now memory-mcp
+```
+
+### Set the key in the secret (one-time)
+
+```bash
+printf %s 'YOUR-KEY' | gcloud secrets versions add PERSONAL_MCP_API_KEY \
+  --project=sonic-totem-447414-t7 --data-file=-
+```
+
+### Connect your agent
+
+**opencode** (`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "mcp": {
+    "memory": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8737/mcp",
+      "headers": { "Authorization": "Bearer {env:MEMORY_MCP_KEY}" },
+      "enabled": true
+    }
+  }
+}
+```
+
+Then point opencode at the same key:
+
+```bash
+export MEMORY_MCP_KEY="$(gcloud secrets access latest --secret=PERSONAL_MCP_API_KEY --project=sonic-totem-447414-t7)"
+```
+
+(Add to your shell profile, then restart opencode.)
+
+**Claude Code** (stdio mode):
+
+```bash
+claude mcp add memory -- /absolute/path/to/memory-mcp/target/release/memory-mcp
+```
+
 ## Configuration
 
 Environment variables (all optional):
@@ -51,31 +114,11 @@ Environment variables (all optional):
 | `MEMORY_VAULT_PATH` | `~/Projects/Personal/vault` |
 | `MEMORY_DB_PATH` | `~/.local/share/memory-mcp/index.db` |
 | `MEMORY_MODEL_DIR` | `~/.local/share/memory-mcp/models` |
-
-## Connect your agent
-
-**opencode** (`~/.config/opencode/opencode.json`):
-
-```json
-{
-  "mcp": {
-    "memory": {
-      "type": "local",
-      "command": ["/absolute/path/to/memory-mcp/target/release/memory-mcp"],
-      "enabled": true
-    }
-  }
-}
-```
-
-**Claude Code**:
-
-```bash
-claude mcp add memory -- /absolute/path/to/memory-mcp/target/release/memory-mcp
-```
-
-Restart the agent after configuring. The server appears as the `memory` MCP
-server with 7 tools and one resource.
+| `MEMORY_MCP_TRANSPORT` | `stdio` (`http` for the authenticated HTTP server) |
+| `MEMORY_MCP_BIND` | `127.0.0.1` |
+| `MEMORY_MCP_PORT` | `8737` |
+| `MEMORY_MCP_GCP_PROJECT` | `sonic-totem-447414-t7` |
+| `MEMORY_MCP_SECRET_NAME` | `PERSONAL_MCP_API_KEY` |
 
 ## Tools
 

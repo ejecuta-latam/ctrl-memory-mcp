@@ -28,8 +28,9 @@ Object-oriented design with real encapsulation:
 
 ## Layout
 
-- `src/main.rs` — entrypoint, wires config + server over stdio
-- `src/config.rs` — env config (`MEMORY_VAULT_PATH`, `MEMORY_DB_PATH`, `MEMORY_MODEL_DIR`)
+- `src/main.rs` — entrypoint, wires config + server over stdio or HTTP
+- `src/config.rs` — env config (`MEMORY_VAULT_PATH`, `MEMORY_DB_PATH`, `MEMORY_MODEL_DIR`, transport, bind, port, GCP project/secret)
+- `src/auth.rs` — loads `PERSONAL_MCP_API_KEY` from GCP Secret Manager at startup and gates HTTP requests by Bearer token
 - `src/vault.rs` — file ops against the vault (never touch `.obsidian/`, `.trash/`, or the vault's git)
 - `src/note.rs` — note model: frontmatter, wikilinks, tags
 - `src/embedder.rs` — local ONNX embeddings (ort + all-MiniLM-L6-v2)
@@ -42,3 +43,4 @@ Object-oriented design with real encapsulation:
 - Test: `cargo test`
 - Lint: `cargo clippy -- -D warnings`
 - Run (manual smoke): `cargo run` (expects MCP stdio traffic)
+- Run (http): `MEMORY_MCP_TRANSPORT=http cargo run` (serves `http://127.0.0.1:8737/mcp`, Bearer auth)
