@@ -1,0 +1,121 @@
+name: CI/CD Pipeline for memory-mcp
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_ID: sonic-totem-447414-t7
+      LOCATION: us-central1
+      IMAGE: us-central1-docker.pkg.dev/sonic-totem-447414-t7/ejecuta-repo/memory-mcp
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev
+
+      - name: Restore build cache from GCS
+        id: cache-restore
+        run: |
+          KEY="memory-cargo-${{ hashFiles('Cargo.lock') }}-${{ runner.os }}-1.96.1"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+          if gsutil -q cp "gs://ejecuta-build-cache/$KEY-cargo.tar.zst" /tmp/cargo-cache.tar.zst 2>/dev/null; then
+            tar -I zstd -xf /tmp/cargo-cache.tar.zst -C ~
+            echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+            echo "GCS cargo cache HIT ($KEY)"
+          else
+            echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+            echo "GCS cargo cache MISS ($KEY)"
+          fi
+          if gsutil -q cp "gs://ejecuta-build-cache/$KEY-target.tar.zst" /tmp/target-cache.tar.zst 2>/dev/null; then
+            tar -I zstd -xf /tmp/target-cache.tar.zst -C "$GITHUB_WORKSPACE"
+            echo "GCS target cache HIT"
+          else
+            echo "GCS target cache MISS"
+          fi
+
+      # El Dockerfile espera el binario glibc pre-compilado fuera de la imagen
+      # (target/release/memory-mcp). memory-mcp NO es musl: ort (ONNX Runtime)
+      # es glibc-only. Se usa el toolchain del runner (ubuntu-latest = glibc
+      # 2.39), la misma base que agents-registry.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Build release binary
+        run: |
+          cargo build --release
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ env.IMAGE }}:${{ github.sha }} -f ./Dockerfile .
+          docker tag ${{ env.IMAGE }}:${{ github.sha }} ${{ env.IMAGE }}:latest
+          docker push ${{ env.IMAGE }}:latest
+
+      - name: Save build cache to GCS
+        if: steps.cache-restore.outputs.cache-hit != 'true'
+        run: |
+          KEY="${{ steps.cache-restore.outputs.key }}"
+          tar -I zstd --ignore-failed-read -cf /tmp/cargo-cache.tar.zst -C ~ .cargo/registry
+          gsutil -q cp /tmp/cargo-cache.tar.zst "gs://ejecuta-build-cache/$KEY-cargo.tar.zst"
+          tar -I zstd -cf /tmp/target-cache.tar.zst -C "$GITHUB_WORKSPACE" target
+          gsutil -q cp /tmp/target-cache.tar.zst "gs://ejecuta-build-cache/$KEY-target.tar.zst"
+          echo "GCS cache saved ($KEY)"
+
+  deploy-to-vm:
+    runs-on: ubuntu-latest
+    needs: build-and-deploy
+    env:
+      IMAGE: us-central1-docker.pkg.dev/sonic-totem-447414-t7/ejecuta-repo/memory-mcp
+    steps:
+      - name: Deploy to VM via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.GCP_VM_IP }}
+          username: ${{ secrets.GCP_VM_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # THIS IS THE CRITICAL LINE:
+          envs: IMAGE
+          script: |
+            # 1. Authenticate using gcloud (Standard for Debian)
+            gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+
+            # 2. Pull the latest image (IMAGE is now available as a variable)
+            docker pull $IMAGE:latest
+
+            # 3. Stop and remove the old container
+            docker stop memory-mcp || true
+            docker rm memory-mcp || true
+
+            # 4. Start the new container — same config as the current
+            #    deployment on the VM (internal network, vault bind mount,
+            #    persistent data for index.db + ONNX model, healthcheck).
+            docker run -d \
+              --name memory-mcp \
+              --network risks-vision-network \
+              --restart unless-stopped \
+              --env-file /etc/ejecuta/memory-mcp.env \
+              --health-cmd "curl -f http://localhost:8737/healthz" \
+              --health-interval 30s \
+              --health-timeout 5s \
+              --health-retries 3 \
+              --health-start-period 5s \
+              -v /home/ctrl/memory/vault:/vault \
+              -v /home/ctrl/memory-mcp/data:/data \
+              $IMAGE:latest

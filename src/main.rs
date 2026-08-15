@@ -36,12 +36,18 @@ async fn serve_http(config: config::Config) -> anyhow::Result<()> {
         Default::default(),
         Default::default(),
     );
-    let app = axum::Router::new()
+    let mcp_router = axum::Router::new()
         .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn_with_state(
             api_key.clone(),
             auth::require_api_key,
         ));
+    let app = axum::Router::new()
+        .merge(mcp_router)
+        .route(
+            "/healthz",
+            axum::routing::get(|| async { axum::http::StatusCode::OK }),
+        );
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     eprintln!("memory-mcp listening on http://{addr}/mcp");
     axum::serve(listener, app).await?;

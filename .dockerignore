@@ -1,0 +1,8 @@
+.git
+.github
+tests
+graft
+graft/
+*.md
+.env
+.env.*
