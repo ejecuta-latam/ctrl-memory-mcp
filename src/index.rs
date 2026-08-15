@@ -251,6 +251,13 @@ impl Index {
         Ok(results)
     }
 
+    pub fn all_note_paths(&self) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT path FROM notes")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn chunk_details(&self, chunk_ids: &[i64]) -> anyhow::Result<Vec<ChunkDetail>> {
         let conn = self.conn.lock().unwrap();
         let placeholders = vec!["?"; chunk_ids.len()].join(",");

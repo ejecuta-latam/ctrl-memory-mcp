@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use walkdir::WalkDir;
+use serde::Serialize;
 
 use crate::note::Note;
 
@@ -13,7 +14,7 @@ pub struct VaultFile {
     pub size: i64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NoteMeta {
     pub path: String,
     pub title: String,
