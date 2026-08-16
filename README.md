@@ -99,6 +99,24 @@ export MEMORY_MCP_KEY="$(gcloud secrets access latest --secret=PERSONAL_MCP_API_
 
 (Add to your shell profile, then restart opencode.)
 
+**Production (deployed on the GCP VM)**: the server runs on
+`https://mcp.ejecuta.lat/mcp` behind nginx with TLS, published by the
+`.github/workflows/cicd.yaml` pipeline on push to `develop`. Connect with the
+same Bearer key:
+
+```json
+{
+  "mcp": {
+    "ctrl-memory": {
+      "type": "remote",
+      "url": "https://mcp.ejecuta.lat/mcp",
+      "headers": { "Authorization": "Bearer {env:MEMORY_MCP_KEY}" },
+      "enabled": true
+    }
+  }
+}
+```
+
 **Claude Code** (stdio mode):
 
 ```bash
