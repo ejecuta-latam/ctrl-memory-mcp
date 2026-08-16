@@ -25,6 +25,8 @@ async fn serve_http(config: config::Config) -> anyhow::Result<()> {
     let api_key = auth::ApiKey::load(&config).await?;
     let server_config = config.clone();
     let addr = format!("{}:{}", config.bind, config.port);
+    let http_config = rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig::default()
+        .with_allowed_hosts(["mcp.ejecuta.lat"]);
     let service: rmcp::transport::StreamableHttpService<
         server::MemoryServer,
         rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
@@ -34,7 +36,7 @@ async fn serve_http(config: config::Config) -> anyhow::Result<()> {
                 .map_err(std::io::Error::other)
         },
         Default::default(),
-        Default::default(),
+        http_config,
     );
     let mcp_router = axum::Router::new()
         .nest_service("/mcp", service)
